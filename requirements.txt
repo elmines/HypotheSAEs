@@ -14,7 +14,6 @@ torch
 tqdm
 transformers
 jmespath
-vllm
+vllm==0.28.0
 ipykernel
-flashinfer-jit-cache
-flashinfer-python
+flashinfer-jit-cache==0.6.16.post3
