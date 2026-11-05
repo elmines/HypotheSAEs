@@ -17,8 +17,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-# The dynamic dependencies will be read from requirements.txt
-dynamic = ["dependencies"]
 
 [project.urls]
 "Homepage" = "https://github.com/rmovva/HypotheSAEs"
@@ -31,3 +29,11 @@ include-package-data = true
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]} 
+
+[tool.uv.sources]
+flashinfer-jit-cache = { index = "flashinfer" }
+
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl/cu130/"
+explicit = true
