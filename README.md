@@ -14,6 +14,23 @@ Preprint 📄: [Sparse Autoencoders for Hypothesis Generation](https://arxiv.org
 Website 🌐: https://hypothesaes.org  
 Data 🤗: https://huggingface.co/datasets/rmovva/HypotheSAEs (to reproduce the experiments in the paper)
 
+For stance datasets with a topic/target and a corresponding post, the package
+also provides `get_joint_stance_embeddings()`. It uses the
+[DeBERTa-v3 stance checkpoint](https://huggingface.co/NLP-Debater-Project/debertav3-stance-detection)
+to encode each pair jointly:
+
+```python
+from hypothesaes import get_joint_stance_embeddings
+
+embeddings = get_joint_stance_embeddings(
+    targets=["AI should replace human teachers"],
+    posts=["Teachers provide emotional support that AI cannot replicate"],
+)
+```
+
+The returned array is aligned with the input pairs and can be passed directly
+to `train_sae()`.
+
 **Questions?** Please read the [FAQ](#faq) and README; if not addressed, open an issue or contact us at rmovva@berkeley.edu and kennypeng@cs.cornell.edu.
 
 ## Table of Contents

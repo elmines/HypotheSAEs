@@ -15,7 +15,8 @@ from .sae import (
 
 from .embedding import (
     get_openai_embeddings,
-    get_local_embeddings
+    get_local_embeddings,
+    get_joint_stance_embeddings,
 )
 
 from .interpret_neurons import (
@@ -49,6 +50,7 @@ __all__ = [
     # Embedding functions
     "get_openai_embeddings",
     "get_local_embeddings",
+    "get_joint_stance_embeddings",
     
     # Interpretation classes
     "NeuronInterpreter",

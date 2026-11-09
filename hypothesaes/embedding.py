@@ -1,7 +1,7 @@
 """Utilities for computing text embeddings."""
 
 import numpy as np
-from typing import List, Optional, Dict
+from typing import Dict, List, Optional, Sequence
 import concurrent.futures
 from tqdm.auto import tqdm
 import tiktoken
@@ -13,8 +13,8 @@ import torch
 import openai
 from .utils import filter_invalid_texts
 from sentence_transformers import SentenceTransformer
-import torch
 import gc
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 # Use environment variable for cache dir if set, otherwise use default
@@ -222,7 +222,7 @@ def get_local_embeddings(
     
     if not texts_to_embed:
         return text2embedding
-    
+
     # Enable TF32-backed float32 matmul on supported GPUs to avoid repeated warnings
     # from torch compile paths and improve embedding throughput.
     torch.set_float32_matmul_precision("high")
@@ -275,3 +275,73 @@ def get_local_embeddings(
         torch.cuda.empty_cache()
     
     return text2embedding
+
+
+def get_joint_stance_embeddings(
+    targets: Sequence[str],
+    posts: Sequence[str],
+    model: str = "NLP-Debater-Project/debertav3-stance-detection",
+    batch_size: int = 8,
+    max_length: int = 512,
+    show_progress: bool = True,
+    device: Optional[torch.device] = None,
+) -> np.ndarray:
+    """Embed target/post pairs with a stance-detection model.
+
+    Each target/post pair is formatted as ``Topic: {target} [SEP] Argument:
+    {post}``, matching the model card's recommended input format. Embeddings
+    are mean pooled from the model's final encoder layer and returned in input
+    order.
+    """
+    if len(targets) != len(posts):
+        raise ValueError("targets and posts must have the same length.")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if max_length <= 0:
+        raise ValueError("max_length must be positive.")
+    if any(not isinstance(text, str) or not text.strip() for text in (*targets, *posts)):
+        raise ValueError("targets and posts must contain non-empty strings.")
+
+    embedding_device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    stance_model = AutoModelForSequenceClassification.from_pretrained(model)
+    stance_model.to(embedding_device)
+    stance_model.eval()
+
+    embeddings = []
+    batch_starts = range(0, len(targets), batch_size)
+    if show_progress:
+        batch_starts = tqdm(batch_starts, desc="Embedding target/post pairs")
+
+    with torch.inference_mode():
+        for start in batch_starts:
+            batch_texts = [
+                f"Topic: {target} [SEP] Argument: {post}"
+                for target, post in zip(
+                    targets[start:start + batch_size],
+                    posts[start:start + batch_size],
+                )
+            ]
+            inputs = tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            inputs = {key: value.to(embedding_device) for key, value in inputs.items()}
+            outputs = stance_model(**inputs, output_hidden_states=True)
+            hidden = outputs.hidden_states[-1]
+            mask = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+            embeddings.append(pooled.cpu().numpy())
+
+    hidden_size = int(stance_model.config.hidden_size)
+    del stance_model
+    gc.collect()
+    if embedding_device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    if not embeddings:
+        return np.empty((0, hidden_size), dtype=np.float32)
+    return np.concatenate(embeddings, axis=0).astype(np.float32, copy=False)
