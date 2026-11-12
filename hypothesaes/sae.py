@@ -22,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
 
 
 class SepSae(nn.Module):
@@ -727,3 +729,85 @@ def load_model(path: str, device: str = "cuda" if torch.cuda.is_available() else
     model.load_state_dict(ckpt["state_dict"])
     print(f"Loaded model from {path} onto device {model.device}")
     return model
+
+class CrossSae(SparseAutoencoder):
+    def __init__(self,
+                embed_name = "nomic-ai/modernbert-embed-base",
+                 **kwargs):
+        embedder = AutoModelForSequenceClassification.from_pretrained(embed_name).eval()
+        embed_dim = embedder.config.hidden_size
+        print(f"embed_dim={embed_dim}")
+        super().__init__(input_dim=2 * embed_dim, **kwargs)
+        self.embed_dim = embed_dim
+        self.embedder: torch.nn.Module = embedder
+        self.tokenizer = AutoTokenizer.from_pretrained(embed_name)
+        for w in self.embedder.parameters():
+            w.requires_grad_ = False
+
+        self.film_gate = torch.nn.Sequential(
+            torch.nn.Linear(embed_dim, embed_dim, bias=True),
+            torch.nn.Tanh()
+        )
+        self.film_bias = torch.nn.Linear(embed_dim, embed_dim)
+        # self.post_tran = torch.nn.Linear(embed_dim, 2 * embed_dim)
+
+    @torch.inference_mode
+    def preprocess(self, targets: list[str], text: list[str], batch_size: int = 16):
+        if len(targets) != len(text):
+            raise ValueError("targets and text must have the same length")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+
+        device = next(self.embedder.parameters()).device
+        if not targets:
+            return torch.empty((0, 2 * self.embed_dim), device=device)
+
+        def embed_batch(items: list[str]):
+            tokenized = self.tokenizer(
+                items,
+                padding=False,
+                truncation=True,
+                return_attention_mask=True,
+            )
+            sorted_indices = sorted(
+                range(len(items)),
+                key=lambda index: len(tokenized["input_ids"][index]),
+            )
+            dataloader = DataLoader(
+                sorted_indices,
+                batch_size=batch_size,
+                shuffle=False,
+                collate_fn=lambda indices: self.tokenizer.pad(
+                    {
+                        key: [tokenized[key][index] for index in indices]
+                        for key in tokenized
+                    },
+                    return_tensors="pt",
+                ),
+                pin_memory=device.type == "cuda",
+            )
+
+            sorted_embeddings = []
+            for batch in tqdm(dataloader, desc="Embedding batches"):
+                sorted_embeddings.extend(self._embed(
+                    batch.to(device, non_blocking=device.type == "cuda")
+                ))
+
+            embeddings = [None] * len(items)
+            for index, embedding in zip(sorted_indices, sorted_embeddings):
+                embeddings[index] = embedding
+            return torch.stack(embeddings)
+
+        text_embeddings = embed_batch(list(text))
+        target_embeddings = embed_batch(list(targets))
+        return torch.cat((target_embeddings, text_embeddings), dim=-1).detach().cpu()
+
+    def _embed(self, doc_ids):
+        return self.embedder.base_model(**doc_ids).last_hidden_state[:, 0]
+
+    def forward(self, x: torch.Tensor):
+        A = x[..., :self.embed_dim]
+        B = x[..., self.embed_dim:]
+        mixed = self.film_gate(A) * B + self.film_bias(A)
+        recon, info = super().forward( torch.cat([A, mixed], dim=1) )
+        return recon, info
