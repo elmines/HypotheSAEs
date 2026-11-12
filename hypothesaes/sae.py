@@ -24,6 +24,291 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
 
+class SepSae(nn.Module):
+    """Two independent sparse autoencoders for two document collections.
+
+    Documents are embedded independently with the same frozen text embedder.
+    Each embedding is then encoded and reconstructed by its own SAE, allowing
+    the two streams to use different numbers of active neurons.
+    """
+
+    def __init__(
+        self,
+        m_total_neurons: int,
+        k1: int,
+        k2: int,
+        *,
+        embed_name: str = "nomic-ai/modernbert-embed-base",
+        embedder: Optional[nn.Module] = None,
+        tokenizer=None,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        **sae_kwargs,
+    ) -> None:
+        super().__init__()
+        if k1 < 1 or k2 < 1:
+            raise ValueError("k1 and k2 must be positive")
+
+        if embedder is None or tokenizer is None:
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            if embedder is None:
+                embedder = AutoModelForSequenceClassification.from_pretrained(
+                    embed_name
+                )
+            if tokenizer is None:
+                tokenizer = AutoTokenizer.from_pretrained(embed_name)
+
+        self.embedder = embedder.eval()
+        self.tokenizer = tokenizer
+        self.embed_name = embed_name
+        self.device = torch.device(device)
+        self.embedder.to(self.device)
+        for parameter in self.embedder.parameters():
+            parameter.requires_grad_(False)
+
+        self.embed_dim = self._get_embed_dim(self.embedder)
+        self.sae1 = SparseAutoencoder(
+            input_dim=self.embed_dim,
+            m_total_neurons=m_total_neurons,
+            k_active_neurons=k1,
+            device=device,
+            **sae_kwargs,
+        )
+        self.sae2 = SparseAutoencoder(
+            input_dim=self.embed_dim,
+            m_total_neurons=m_total_neurons,
+            k_active_neurons=k2,
+            device=device,
+            **sae_kwargs,
+        )
+
+    @staticmethod
+    def _get_embed_dim(embedder: nn.Module) -> int:
+        config = getattr(embedder, "config", None)
+        embed_dim = getattr(config, "hidden_size", None)
+        if embed_dim is None:
+            embed_dim = getattr(config, "hidden_dim", None)
+        if embed_dim is None:
+            raise ValueError("embedder.config must define hidden_size or hidden_dim")
+        return int(embed_dim)
+
+    def _embed(self, batch) -> torch.Tensor:
+        if hasattr(self.embedder, "base_model"):
+            outputs = self.embedder.base_model(**batch)
+        else:
+            outputs = self.embedder(**batch)
+        if hasattr(outputs, "last_hidden_state"):
+            return outputs.last_hidden_state[:, 0]
+        if isinstance(outputs, dict) and "last_hidden_state" in outputs:
+            return outputs["last_hidden_state"][:, 0]
+        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
+            return outputs.pooler_output
+        raise ValueError("embedder output must provide last_hidden_state or pooler_output")
+
+    @torch.inference_mode()
+    def preprocess(
+        self,
+        documents1: list[str] | str,
+        documents2: list[str] | str,
+        batch_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Embed each document collection independently.
+
+        The two collections may contain different numbers of documents. The
+        returned tensors are on the model device and can be passed to
+        :meth:`forward`.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        self.embedder.eval()
+
+        def embed_documents(documents: list[str] | str) -> torch.Tensor:
+            if isinstance(documents, str):
+                documents = [documents]
+            if not documents:
+                return torch.empty((0, self.embed_dim), device=self.device)
+            embeddings = []
+            indices = list(range(0, len(documents), batch_size))
+            for start in tqdm(indices, desc='Computing embeddings'):
+                batch = self.tokenizer(
+                    documents[start : start + batch_size],
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                batch = {
+                    key: value.to(self.device) for key, value in batch.items()
+                }
+                embeddings.append(self._embed(batch))
+            return torch.cat(embeddings, dim=0)
+
+        return embed_documents(documents1), embed_documents(documents2)
+
+    def forward(
+        self, embeddings1: torch.Tensor, embeddings2: torch.Tensor
+    ) -> Tuple[Tuple[torch.Tensor, Dict], Tuple[torch.Tensor, Dict]]:
+        """Reconstruct two batches of embeddings with their corresponding SAE."""
+        if embeddings1.shape[-1] != self.embed_dim or embeddings2.shape[-1] != self.embed_dim:
+            raise ValueError(f"both embeddings must have final dimension {self.embed_dim}")
+        return self.sae1(embeddings1), self.sae2(embeddings2)
+
+    def compute_loss(
+        self,
+        embeddings1: torch.Tensor,
+        embeddings2: torch.Tensor,
+        outputs1: Tuple[torch.Tensor, Dict],
+        outputs2: Tuple[torch.Tensor, Dict],
+        aux_coef: float = 1 / 32,
+        multi_coef: float = 0.0,
+    ) -> torch.Tensor:
+        """Return the mean reconstruction loss for both embedding streams."""
+        recon1, info1 = outputs1
+        recon2, info2 = outputs2
+        loss1 = self.sae1.compute_loss(
+            embeddings1, recon1, info1, aux_coef, multi_coef
+        )
+        loss2 = self.sae2.compute_loss(
+            embeddings2, recon2, info2, aux_coef, multi_coef
+        )
+        return (loss1 + loss2) / 2
+
+    def fit(
+        self,
+        X_train1: torch.Tensor,
+        X_train2: torch.Tensor,
+        X_val1: Optional[torch.Tensor] = None,
+        X_val2: Optional[torch.Tensor] = None,
+        batch_size: int = 512,
+        learning_rate: float = 5e-4,
+        n_epochs: int = 200,
+        aux_coef: float = 1 / 32,
+        multi_coef: float = 0.0,
+        patience: int = 5,
+        show_progress: bool = True,
+        clip_grad: float = 1.0,
+    ) -> Dict:
+        """Train both sparse autoencoders on their respective embeddings."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if len(X_train1) == 0 or len(X_train2) == 0:
+            raise ValueError("training embeddings must not be empty")
+        if (X_val1 is None) != (X_val2 is None):
+            raise ValueError("X_val1 and X_val2 must be provided together")
+        if X_val1 is not None and (len(X_val1) == 0 or len(X_val2) == 0):
+            raise ValueError("validation embeddings must not be empty")
+
+        train_loaders = (
+            DataLoader(TensorDataset(X_train1), batch_size=batch_size, shuffle=True),
+            DataLoader(TensorDataset(X_train2), batch_size=batch_size, shuffle=True),
+        )
+        val_loaders = None
+        if X_val1 is not None and X_val2 is not None:
+            val_loaders = (
+                DataLoader(TensorDataset(X_val1), batch_size=batch_size),
+                DataLoader(TensorDataset(X_val2), batch_size=batch_size),
+            )
+
+        self.sae1.initialize_weights_(X_train1.to(self.device))
+        self.sae2.initialize_weights_(X_train2.to(self.device))
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        history = {"train_loss": [], "val_loss": [], "dead_neuron_ratio": []}
+        best_val_loss = float("inf")
+        patience_counter = 0
+
+        def paired_batches(loaders):
+            iterators = [iter(loader) for loader in loaders]
+            remaining = max(len(loader) for loader in loaders)
+            for index in range(remaining):
+                batches = []
+                for loader_index, iterator in enumerate(iterators):
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        iterators[loader_index] = iter(loaders[loader_index])
+                        batch = next(iterators[loader_index])
+                    batches.append(batch[0])
+                yield batches
+
+        iterator = tqdm(range(n_epochs)) if show_progress else range(n_epochs)
+        for epoch in iterator:
+            self.train()
+            self.embedder.eval()
+            train_losses = []
+            for batch1, batch2 in paired_batches(train_loaders):
+                batch1 = batch1.to(self.device)
+                batch2 = batch2.to(self.device)
+                outputs1, outputs2 = self(batch1, batch2)
+                loss = self.compute_loss(
+                    batch1, batch2, outputs1, outputs2, aux_coef, multi_coef
+                )
+
+                optimizer.zero_grad()
+                loss.backward()
+                self.sae1.adjust_decoder_gradient_()
+                self.sae2.adjust_decoder_gradient_()
+                if clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), clip_grad)
+                optimizer.step()
+                self.sae1.normalize_decoder_()
+                self.sae2.normalize_decoder_()
+                train_losses.append(loss.item())
+
+            avg_train_loss = float(np.mean(train_losses))
+            history["train_loss"].append(avg_train_loss)
+            dead_ratio = float(
+                torch.cat(
+                    (self.sae1.steps_since_activation, self.sae2.steps_since_activation)
+                )
+                .gt(self.sae1.dead_neuron_threshold_steps)
+                .float()
+                .mean()
+                .item()
+            )
+            history["dead_neuron_ratio"].append(dead_ratio)
+
+            if val_loaders is not None:
+                self.eval()
+                val_losses = []
+                with torch.no_grad():
+                    for batch1, batch2 in paired_batches(val_loaders):
+                        batch1 = batch1.to(self.device)
+                        batch2 = batch2.to(self.device)
+                        outputs1, outputs2 = self(batch1, batch2)
+                        val_losses.append(
+                            self.compute_loss(
+                                batch1,
+                                batch2,
+                                outputs1,
+                                outputs2,
+                                aux_coef,
+                                multi_coef,
+                            ).item()
+                        )
+
+                avg_val_loss = float(np.mean(val_losses))
+                history["val_loss"].append(avg_val_loss)
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        break
+
+            if show_progress:
+                iterator.set_postfix(
+                    train_loss=f"{avg_train_loss:.4f}",
+                    val_loss=(
+                        f"{history['val_loss'][-1]:.4f}"
+                        if val_loaders is not None
+                        else "N/A"
+                    ),
+                    dead_ratio=f"{dead_ratio:.3f}",
+                )
+
+        return history
+
+
 # ----------------------------------------------------------------------------
 # Sparse Autoencoder with optional Matryoshka loss
 # ----------------------------------------------------------------------------

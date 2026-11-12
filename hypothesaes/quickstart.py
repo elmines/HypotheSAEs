@@ -7,7 +7,7 @@ import torch
 import os
 from pathlib import Path
 
-from .sae import SparseAutoencoder, load_model, get_sae_checkpoint_name
+from .sae import SepSae, SparseAutoencoder, load_model, get_sae_checkpoint_name
 from .select_neurons import select_neurons
 from .interpret_neurons import NeuronInterpreter, InterpretConfig, ScoringConfig, LLMConfig, SamplingConfig
 from .utils import get_text_for_printing
@@ -105,8 +105,8 @@ def train_sae(
 
 def interpret_sae(
     texts: List[str],
-    embeddings: Union[List, np.ndarray],
-    sae: SparseAutoencoder,
+    embeddings: Union[List, np.ndarray, Tuple[Any, Any]],
+    sae: Union[SparseAutoencoder, SepSae],
     *,
     neuron_indices: Optional[List[int]] = None,
     n_random_neurons: Optional[int] = None,
@@ -126,8 +126,11 @@ def interpret_sae(
     
     Args:
         texts: Input text examples
-        embeddings: Pre-computed embeddings for the input texts
-        sae: A trained SAE model
+        embeddings: Pre-computed embeddings for the input texts. For a
+            :class:`SepSae`, pass ``(embeddings1, embeddings2)``.
+        sae: A trained SAE model, or a trained :class:`SepSae`. For a
+            ``SepSae``, provide the already-formatted text examples expected
+            by the caller.
         neuron_indices: Specific neuron indices to interpret (mutually exclusive with n_random_neurons and n_top_neurons)
         n_random_neurons: Number of random neurons to interpret (mutually exclusive with neuron_indices and n_top_neurons)
         n_top_neurons: Number of most prevalent neurons to interpret (mutually exclusive with neuron_indices and n_random_neurons)
@@ -149,13 +152,30 @@ def interpret_sae(
     if sum(p is not None for p in selection_params) != 1:
         raise ValueError("Exactly one of neuron_indices, n_random_neurons, or n_top_neurons must be provided")
     
-    if not isinstance(embeddings, torch.Tensor):
-        X = torch.tensor(embeddings, dtype=torch.float)
+    is_pair = isinstance(embeddings, tuple) and len(embeddings) == 2
+    if isinstance(sae, SepSae):
+        if not is_pair:
+            raise ValueError("SepSae requires embeddings=(embeddings1, embeddings2)")
+
+        embedding1, embedding2 = embeddings
+        X1 = embedding1 if isinstance(embedding1, torch.Tensor) else torch.tensor(embedding1, dtype=torch.float)
+        X2 = embedding2 if isinstance(embedding2, torch.Tensor) else torch.tensor(embedding2, dtype=torch.float)
+
+        if len(X1) != len(X2) or len(X1) != len(texts):
+            raise ValueError("paired embeddings and texts must have the same length")
+
+        activations1 = sae.sae1.get_activations(X1)
+        activations2 = sae.sae2.get_activations(X2)
+        activations = np.concatenate((activations1, activations2), axis=1)
+        neuron_sources = ["sae1"] * activations1.shape[1] + ["sae2"] * activations2.shape[1]
     else:
-        X = embeddings
-    
-    # Get activations from SAE
-    activations = sae.get_activations(X)
+        if not isinstance(embeddings, torch.Tensor):
+            X = torch.tensor(embeddings, dtype=torch.float)
+        else:
+            X = embeddings
+        activations = sae.get_activations(X)
+        neuron_sources = [None] * activations.shape[1]
+
     print(f"Activations shape: {activations.shape}")
     # Compute prevalence for each neuron (percentage of examples where activation != 0)
     activation_counts = (activations != 0).sum(axis=0)
@@ -206,6 +226,9 @@ def interpret_sae(
             "neuron_idx": int(idx),
             "interpretation": interpretations[idx][0] if n_candidates == 1 else interpretations[idx]
         }
+        if neuron_sources[idx] is not None:
+            result_dict["sae"] = neuron_sources[idx]
+            result_dict["local_neuron_idx"] = int(idx % (activations.shape[1] // 2))
         
         if print_examples_n > 0:
             top_indices = np.argsort(neuron_activations)[-print_examples_n:][::-1]
@@ -220,6 +243,187 @@ def interpret_sae(
         results_list.append(result_dict)
 
     return pd.DataFrame(results_list)
+
+def interpret_sep_sae(
+    topics: List[str],
+    texts: List[str],
+    sae: SepSae,
+    *,
+    neuron_indices_topics: Optional[List[int]] = None,
+    neuron_indices_texts: Optional[List[int]] = None,
+    n_random_neurons: Optional[int] = None,
+    n_top_neurons: Optional[int] = None,
+    interpreter_model: str = "gpt-5.2",
+    n_examples_for_interpretation: int = 20,
+    max_words_per_example: int = 256,
+    interpret_temperature: float = 0.7,
+    max_interpretation_tokens: Optional[int] = None,
+    interpret_llm_kwargs: Optional[Dict[str, Any]] = None,
+    n_candidates: int = 1,
+    print_examples_n: int = 3,
+    print_examples_max_chars: int = 1024,
+    topic_task_specific_instructions: str = (
+        "This is a stance detection task. These examples are topics. "
+        "Interpret the feature in terms of topic-level stance or subject matter."
+    ),
+    text_task_specific_instructions: str = (
+        "This is a stance detection task. These examples are texts expressing or discussing "
+        "stance. Interpret the feature in terms of the stance or content expressed."
+    ),
+) -> Dict[str, pd.DataFrame]:
+    """Interpret separate topic and text neuron sets from a :class:`SepSae`.
+
+    The topics are embedded and interpreted with ``sae.sae1``; the texts are
+    embedded and interpreted with ``sae.sae2``. Each stream is sent to the
+    interpreter independently, so examples from one stream cannot appear in
+    prompts or results for the other stream.
+
+    ``topic_task_specific_instructions`` and
+    ``text_task_specific_instructions`` customize the interpretation prompts
+    independently. Their defaults describe the two streams in a stance task.
+
+    Returns:
+        A dictionary with ``"topics"`` and ``"texts"`` DataFrames. Each
+        DataFrame contains ``neuron_idx``, ``interpretation``, and top-example
+        columns when ``print_examples_n`` is positive.
+    """
+    if not isinstance(sae, SepSae):
+        raise TypeError("sae must be a SepSae")
+    if not topics or not texts:
+        raise ValueError("topics and texts must both be non-empty")
+
+    selection_params = [
+        neuron_indices_topics,
+        neuron_indices_texts,
+        n_random_neurons,
+        n_top_neurons,
+    ]
+    if sum(param is not None for param in selection_params) not in (1, 2):
+        raise ValueError(
+            "Provide n_random_neurons or n_top_neurons, or provide both "
+            "neuron_indices_topics and neuron_indices_texts"
+        )
+    if (neuron_indices_topics is None) != (neuron_indices_texts is None):
+        raise ValueError(
+            "neuron_indices_topics and neuron_indices_texts must be provided together"
+        )
+    if (
+        neuron_indices_topics is not None
+        and (n_random_neurons is not None or n_top_neurons is not None)
+    ):
+        raise ValueError(
+            "Explicit neuron indices cannot be combined with random or top selection"
+        )
+
+    topic_embeddings, text_embeddings = sae.preprocess(topics, texts)
+    topic_activations = sae.sae1.get_activations(topic_embeddings)
+    text_activations = sae.sae2.get_activations(text_embeddings)
+
+    interpreter = NeuronInterpreter(interpreter_model=interpreter_model)
+
+    def interpret_stream(
+        name: str,
+        examples: List[str],
+        activations: np.ndarray,
+        explicit_indices: Optional[List[int]],
+        task_specific_instructions: str,
+    ) -> pd.DataFrame:
+        activation_counts = (activations != 0).sum(axis=0)
+        total_neurons = activations.shape[1]
+        if explicit_indices is not None:
+            selected = np.asarray(explicit_indices, dtype=int)
+            if np.any(selected < 0) or np.any(selected >= total_neurons):
+                raise ValueError(
+                    f"{name} neuron indices must be between 0 and {total_neurons - 1}"
+                )
+        elif n_random_neurons is not None:
+            if n_random_neurons > total_neurons:
+                raise ValueError(
+                    f"n_random_neurons ({n_random_neurons}) cannot exceed "
+                    f"the {name} SAE's {total_neurons} neurons"
+                )
+            selected = np.random.choice(
+                total_neurons, size=n_random_neurons, replace=False
+            )
+        else:
+            if n_top_neurons > total_neurons:
+                raise ValueError(
+                    f"n_top_neurons ({n_top_neurons}) cannot exceed "
+                    f"the {name} SAE's {total_neurons} neurons"
+                )
+            selected = np.argsort(activation_counts)[-n_top_neurons:][::-1]
+
+        selected_list = [int(index) for index in selected]
+        print(f"{name.capitalize()} activations shape: {activations.shape}")
+        interpret_config = InterpretConfig(
+            sampling=SamplingConfig(
+                n_examples=n_examples_for_interpretation,
+                max_words_per_example=max_words_per_example,
+            ),
+            llm=LLMConfig(
+                temperature=interpret_temperature,
+                max_output_tokens=max_interpretation_tokens,
+                llm_kwargs=interpret_llm_kwargs or {},
+            ),
+            n_candidates=n_candidates,
+            task_specific_instructions=task_specific_instructions,
+        )
+        interpretations = interpreter.interpret_neurons(
+            texts=examples,
+            activations=activations,
+            neuron_indices=selected_list,
+            config=interpret_config,
+        )
+
+        results = []
+        activation_percent = activation_counts / len(examples) * 100
+        for index in selected_list:
+            result = {
+                "neuron_idx": index,
+                "interpretation": (
+                    interpretations[index][0]
+                    if n_candidates == 1
+                    else interpretations[index]
+                ),
+                "activation_percent": activation_percent[index],
+            }
+            if print_examples_n > 0:
+                top_indices = np.argsort(activations[:, index])[
+                    -print_examples_n:
+                ][::-1]
+                print(
+                    f"\n{name.capitalize()} neuron {index} "
+                    f"({activation_percent[index]:.1f}% active): "
+                    f"{interpretations[index][0]}"
+                )
+                print("\nTop activating examples:")
+                for rank, example_index in enumerate(top_indices, 1):
+                    example = examples[example_index]
+                    print(
+                        f"{rank}. "
+                        f"{get_text_for_printing(example, max_chars=print_examples_max_chars)}"
+                    )
+                    result[f"top_example_{rank}"] = example
+                print("-" * 100)
+            results.append(result)
+        return pd.DataFrame(results)
+
+    return {
+        "topics": interpret_stream(
+            "topics",
+            topics,
+            topic_activations,
+            neuron_indices_topics,
+            topic_task_specific_instructions,
+        ),
+        "texts": interpret_stream(
+            "texts",
+            texts,
+            text_activations,
+            neuron_indices_texts,
+            text_task_specific_instructions,
+        ),
+    }
 
 def generate_hypotheses(
     texts: List[str],

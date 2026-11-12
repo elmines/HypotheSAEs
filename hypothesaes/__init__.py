@@ -4,12 +4,14 @@
 from .quickstart import (
     train_sae,
     interpret_sae,
+    interpret_sep_sae,
     generate_hypotheses,
     evaluate_hypotheses
 )
 
 from .sae import (
     SparseAutoencoder,
+    SepSae,
     load_model
 )
 
@@ -40,11 +42,13 @@ __all__ = [
     # Main workflow functions
     "train_sae",
     "interpret_sae", 
+    "interpret_sep_sae",
     "generate_hypotheses", 
     "evaluate_hypotheses",
     
     # Core classes
     "SparseAutoencoder",
+    "SepSae",
     "load_model",
     
     # Embedding functions
