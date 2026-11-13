@@ -1,7 +1,7 @@
 """Utilities for computing text embeddings."""
 
 import numpy as np
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 import concurrent.futures
 from tqdm.auto import tqdm
 import tiktoken
@@ -210,9 +210,14 @@ def get_local_embeddings(
     show_progress: bool = True,
     cache_name: Optional[str] = None,
     chunk_size: int = 50000,
-    device: Optional[torch.device] = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-) -> Dict[str, np.ndarray]:
-    """Get embeddings using local SentenceTransformer model with chunked caching."""
+    device: Optional[torch.device] = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    return_stacked: bool = False,
+) -> Union[Dict[str, np.ndarray], np.ndarray]:
+    """Get embeddings using local SentenceTransformer model with chunked caching.
+
+    By default, return a mapping from text to embedding. If ``return_stacked`` is
+    true, return embeddings as a NumPy array in the order of ``texts`` instead.
+    """
     # Filter out None values and empty strings
     texts = filter_invalid_texts(texts)
     
@@ -221,6 +226,8 @@ def get_local_embeddings(
     texts_to_embed = [text for text in texts if text not in text2embedding]
     
     if not texts_to_embed:
+        if return_stacked:
+            return np.stack([text2embedding[text] for text in texts])
         return text2embedding
 
     # Enable TF32-backed float32 matmul on supported GPUs to avoid repeated warnings
@@ -274,6 +281,8 @@ def get_local_embeddings(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
+    if return_stacked:
+        return np.stack([text2embedding[text] for text in texts])
     return text2embedding
 
 
