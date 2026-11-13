@@ -15,9 +15,8 @@ dependencies = [
 [project.scripts]
 server-scripts = "server_scripts:main"
 
-[build-system]
-requires = ["uv_build>=0.13.4,<0.14.0"]
-build-backend = "uv_build"
+[tool.uv.sources]
+flashinfer-jit-cache = { index = "flashinfer" }
 
 [[tool.uv.index]]
 name = "flashinfer"

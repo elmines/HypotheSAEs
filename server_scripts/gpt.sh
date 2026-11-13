@@ -6,7 +6,7 @@ mem_usage=${MEM_USAGE:-0.80}
 
 API_PORT=${API_PORT:-8001}
 
-$RUN_PREFIX uv run vllm serve \
+$RUN_PREFIX uv run --active vllm serve \
     "$model" \
     --host 0.0.0.0 \
     --port $API_PORT \
