@@ -24,6 +24,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+def abs_topk(input: torch.Tensor, k: int, dim=-1):
+    signs = torch.sign(input)
+    top_mags, top_inds = torch.topk(torch.abs(input), k, dim=dim)
+    top_signs = torch.gather(signs, dim, top_inds)
+    return top_signs * top_mags, top_inds
 
 
 class SepSae(nn.Module):
@@ -324,6 +329,7 @@ class SparseAutoencoder(nn.Module):
         *,
         aux_k: Optional[int] = None,
         multi_k: Optional[int] = None,
+        use_abs_topk: bool = False,
         dead_neuron_threshold_steps: int = 256,
         prefix_lengths: Optional[List[int]] = None,
         use_batch_topk: bool = False,
@@ -357,6 +363,7 @@ class SparseAutoencoder(nn.Module):
         """
 
         super().__init__()
+
         self.input_dim = input_dim
         self.m_total_neurons = m_total_neurons
         self.k_active_neurons = k_active_neurons
@@ -367,6 +374,7 @@ class SparseAutoencoder(nn.Module):
             min(2 * k_active_neurons, m_total_neurons) if aux_k is None else aux_k
         )
         self.multi_k = multi_k
+        self.use_abs_topk = use_abs_topk
         self.dead_neuron_threshold_steps = dead_neuron_threshold_steps
 
         # Matryoshka prefixes as full lengths --------------------------------
@@ -397,6 +405,22 @@ class SparseAutoencoder(nn.Module):
         self.device = device
         self.to(self.device)
 
+        if self.use_abs_topk:
+            assert not self.use_batch_topk, "use_batch_topk and use_abs_topk are not currently supported"
+            assert not self.multi_k,        "multi_k and use_abs_topk are not currently supported"
+            # assert not self.aux_k,          "aux_k and use_abs_topk are not currently supported"
+
+    def topk(self, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.use_abs_topk:
+            return abs_topk(*args, **kwargs)
+        return torch.topk(*args, **kwargs)
+
+    def relu(self, x: torch.Tensor):
+        if self.use_abs_topk:
+            return torch.sign(x) * F.relu(torch.abs(x))
+        return F.relu(x)
+
+
     # ---------------------------------------------------------------------
     # Forward pass (agnostic to Matryoshka configuration)
     # ---------------------------------------------------------------------
@@ -409,8 +433,8 @@ class SparseAutoencoder(nn.Module):
         topk_idx = topk_vals = None  # reported only for hard Top-K
         if not self.use_batch_topk:
             # main Top-K ---------------------------------------------------------
-            local_vals, local_idx = torch.topk(pre_act, self.k_active_neurons, dim=-1)
-            local_vals = F.relu(local_vals)
+            local_vals, local_idx = self.topk(pre_act, self.k_active_neurons, dim=-1)
+            local_vals = self.relu(local_vals)
             activ = torch.zeros_like(pre_act)
             activ.scatter_(-1, local_idx, local_vals)
             topk_idx, topk_vals = local_idx, local_vals
@@ -442,7 +466,9 @@ class SparseAutoencoder(nn.Module):
 
         # -------------------- Shared: dead-neuron tracking ---------------
         self.steps_since_activation += 1
-        fired = (activ.sum(dim=0) > 0).nonzero(as_tuple=False).squeeze(-1)
+        fired = (
+            (torch.abs(activ) if self.use_abs_topk else activ).sum(dim=0) > 0
+        ).nonzero(as_tuple=False).squeeze(-1)
         if fired.numel() > 0:
             self.steps_since_activation.index_fill_(0, fired, 0)
 
@@ -454,8 +480,8 @@ class SparseAutoencoder(nn.Module):
         if self.aux_k is not None:
             dead_mask = (self.steps_since_activation > self.dead_neuron_threshold_steps).float()
             dead_pre_act = pre_act * dead_mask
-            aux_vals, aux_idx = torch.topk(dead_pre_act, self.aux_k, dim=-1)
-            aux_vals = F.relu(aux_vals)
+            aux_vals, aux_idx = self.topk(dead_pre_act, self.aux_k, dim=-1)
+            aux_vals = self.relu(aux_vals)
 
         info = {
             "activations": activ,  # needed for Matryoshka slices
@@ -580,7 +606,7 @@ class SparseAutoencoder(nn.Module):
         n_epochs: int = 200,
         aux_coef: float = 1 / 32,
         multi_coef: float = 0.0,
-        patience: int = 5,
+        patience: int = 3,
         show_progress: bool = True,
         clip_grad: float = 1.0
     ) -> Dict:
