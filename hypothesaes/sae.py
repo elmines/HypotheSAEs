@@ -738,6 +738,24 @@ class SparseAutoencoder(nn.Module):
         
         return torch.cat(all_activations, dim=0).numpy()
 
+def get_multiple_sae_activations(sae_list: SparseAutoencoder | list[SparseAutoencoder], X, return_neuron_source_info=False, **kwargs):
+    if not isinstance(sae_list, list):
+        sae_list = [sae_list]
+    if not isinstance(X, torch.Tensor):
+        X = torch.tensor(X, dtype=torch.float)
+
+    activations_list = []
+    neuron_source_sae_info = []
+    for (idx, s) in enumerate(sae_list):
+        activations_list.append(s.get_activations(X, **kwargs))
+        neuron_source_sae_info += [(f'SAE_{idx}', s.m_total_neurons, s.k_active_neurons)] * s.m_total_neurons
+    activations = np.concatenate(activations_list, axis=1)
+    
+    if return_neuron_source_info:
+        return activations, neuron_source_sae_info
+    else:
+        return activations
+
 # -----------------------------------------------------------------------------
 # Additional utils
 # -----------------------------------------------------------------------------
