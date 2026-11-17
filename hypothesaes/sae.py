@@ -408,7 +408,6 @@ class SparseAutoencoder(nn.Module):
         if self.use_abs_topk:
             assert not self.use_batch_topk, "use_batch_topk and use_abs_topk are not currently supported"
             assert not self.multi_k,        "multi_k and use_abs_topk are not currently supported"
-            # assert not self.aux_k,          "aux_k and use_abs_topk are not currently supported"
 
     def topk(self, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         if self.use_abs_topk:
