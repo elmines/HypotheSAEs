@@ -5,6 +5,8 @@ from typing import List, Dict, Optional, Tuple, Callable, Any
 from tqdm.auto import tqdm
 import concurrent.futures
 import os
+import json
+import hashlib
 from dataclasses import dataclass, field
 
 from .llm_api import get_completion, normalize_llm_kwargs
@@ -195,6 +197,46 @@ class NeuronInterpreter:
         self.n_workers_annotation = n_workers_annotation
         self.cache_name = cache_name
 
+    def _interpretation_cache_path(self) -> Optional[str]:
+        if self.cache_name is None:
+            return None
+        return os.path.join(CACHE_DIR, f"{self.cache_name}_interpretations.json")
+
+    def _load_interpretation_cache(self) -> Dict[str, str]:
+        cache_path = self._interpretation_cache_path()
+        if cache_path is None or not os.path.exists(cache_path):
+            return {}
+        try:
+            with open(cache_path, "r") as f:
+                cache = json.load(f)
+            return cache if isinstance(cache, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            print(f"Warning: Failed to parse interpretation cache {cache_path}, starting fresh cache")
+            return {}
+
+    def _save_interpretation_cache(self, cache: Dict[str, str]) -> None:
+        cache_path = self._interpretation_cache_path()
+        if cache_path is None:
+            return
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(cache, f)
+
+    def _interpretation_cache_key(
+        self,
+        prompt: str,
+        llm_kwargs: Dict[str, Any],
+        timeout: Optional[float],
+    ) -> str:
+        payload = {
+            "prompt": prompt,
+            "model": self.interpreter_model,
+            "llm_kwargs": llm_kwargs,
+            "timeout": timeout,
+        }
+        serialized = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
     def _build_interpretation_prompt(
         self,
         texts: List[str],
@@ -366,16 +408,41 @@ class NeuronInterpreter:
             )
             prompts.append(prompt)
 
-        # Execute all valid prompts in a single batch (implementation-aware)
-        generated_interpretations = self._execute_prompts(prompts, llm_kwargs, timeout)
+        cache = self._load_interpretation_cache()
+        uncached_indices = []
+        uncached_prompts = []
+        cached_interpretations = {}
+        for idx, prompt in enumerate(prompts):
+            if prompts[idx] is None:
+                cached_interpretations[idx] = None
+                continue
+            cache_key = self._interpretation_cache_key(prompt, llm_kwargs, timeout)
+            if cache_key in cache and isinstance(cache[cache_key], str):
+                cached_interpretations[idx] = cache[cache_key]
+            else:
+                uncached_indices.append(idx)
+                uncached_prompts.append(prompt)
+
+        generated_interpretations = self._execute_prompts(
+            uncached_prompts,
+            llm_kwargs,
+            timeout,
+        )
+        generated_iterator = iter(generated_interpretations)
+        for idx in uncached_indices:
+            interpretation = next(generated_iterator)
+            cached_interpretations[idx] = interpretation
+            if interpretation is not None:
+                prompt = prompts[idx]
+                cache_key = self._interpretation_cache_key(prompt, llm_kwargs, timeout)
+                cache[cache_key] = interpretation
+
+        if uncached_indices:
+            self._save_interpretation_cache(cache)
 
         # Stitch responses back to their respective tasks / neurons
-        interpretations_iterator = iter(generated_interpretations)
         for idx, (neuron_idx, _) in enumerate(interpretation_tasks):
-            if prompts[idx] is None:
-                interpretations[neuron_idx].append(None)
-            else:
-                interpretations[neuron_idx].append(next(interpretations_iterator))
+            interpretations[neuron_idx].append(cached_interpretations[idx])
 
         return interpretations
 

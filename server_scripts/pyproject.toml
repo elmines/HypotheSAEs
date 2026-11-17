@@ -8,7 +8,9 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "backoff>=2.2.1",
     "flashinfer-jit-cache==0.6.16.post3",
+    "litellm[proxy]>=1.109.1",
     "vllm>=0.28.0",
 ]
 

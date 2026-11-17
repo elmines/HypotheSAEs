@@ -1,8 +1,8 @@
 #!/bin/bash
 
 EXTRA_ARGS=($@)
-model=${MODEL:-openai/gpt-oss-120b}
-mem_usage=${MEM_USAGE:-0.80}
+model=${MODEL:-openai/gpt-oss-20b}
+mem_usage=${MEM_USAGE:-0.20}
 
 API_PORT=${API_PORT:-8001}
 

@@ -22,3 +22,28 @@ def test_parse_interpretation_incomplete_think_returns_none():
     interpreter = NeuronInterpreter()
     response = "<think>unfinished reasoning"
     assert interpreter._parse_interpretation(response) is None
+
+
+def test_interpret_neurons_caches_generated_interpretations(tmp_path, monkeypatch):
+    import hypothesaes.interpret_neurons as interpret_module
+    import numpy as np
+
+    monkeypatch.setattr(interpret_module, "CACHE_DIR", str(tmp_path))
+    calls = {"count": 0}
+
+    def fake_completion(**kwargs):
+        calls["count"] += 1
+        return "uses words related to blue"
+
+    monkeypatch.setattr(interpret_module, "get_completion", fake_completion)
+
+    interpreter = NeuronInterpreter(cache_name="test")
+    texts = ["a blue sky", "a red apple"]
+    activations = np.array([[1.0], [0.0]])
+
+    first = interpreter.interpret_neurons(texts, activations, neuron_indices=[0])
+    second = interpreter.interpret_neurons(texts, activations, neuron_indices=[0])
+
+    assert first == {0: ["uses words related to blue"]}
+    assert second == first
+    assert calls["count"] == 1

@@ -1,11 +1,76 @@
 """Methods for selecting relevant neurons based on target variables."""
 
 import time
+import hashlib
+import json
+import os
 import numpy as np
 from typing import List, Optional, Callable, Tuple
 from sklearn.linear_model import Lasso, LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import pearsonr
+
+
+def _selection_cache_signature(
+    activations: np.ndarray,
+    target: np.ndarray,
+    method: str,
+    parameters: dict,
+) -> str:
+    digest = hashlib.sha256()
+    for array in (activations, target):
+        array = np.ascontiguousarray(array)
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(str(array.shape).encode("utf-8"))
+        digest.update(array.tobytes())
+    digest.update(method.encode("utf-8"))
+    digest.update(json.dumps(parameters, sort_keys=True, default=str).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _load_selection_cache(
+    cache_dir: Optional[str],
+    signature: str,
+) -> Optional[Tuple[List[int], List[float]]]:
+    if cache_dir is None:
+        return None
+
+    cache_dir = os.fspath(cache_dir)
+    metadata_path = os.path.join(cache_dir, ".selection_cache.json")
+    indices_path = os.path.join(cache_dir, "indices.npy")
+    coefficients_path = os.path.join(cache_dir, "coefficients.npy")
+    if not all(os.path.exists(path) for path in (metadata_path, indices_path, coefficients_path)):
+        return None
+
+    try:
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        if metadata.get("signature") != signature:
+            return None
+        indices = np.load(indices_path, allow_pickle=False).astype(int).tolist()
+        coefficients = np.load(coefficients_path, allow_pickle=False).astype(float).tolist()
+        if len(indices) != len(coefficients):
+            return None
+        return indices, coefficients
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _save_selection_cache(
+    cache_dir: Optional[str],
+    signature: str,
+    indices: np.ndarray,
+    coefficients: np.ndarray,
+) -> None:
+    if cache_dir is None:
+        return
+
+    cache_dir = os.fspath(cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
+    np.save(os.path.join(cache_dir, "indices.npy"), np.asarray(indices, dtype=int))
+    np.save(os.path.join(cache_dir, "coefficients.npy"), np.asarray(coefficients, dtype=float))
+    with open(os.path.join(cache_dir, ".selection_cache.json"), "w") as f:
+        json.dump({"signature": signature}, f)
 
 def select_neurons_lasso(
     activations: np.ndarray,
@@ -14,7 +79,8 @@ def select_neurons_lasso(
     classification: bool = False,
     alpha: Optional[float] = None,
     max_iter: int = 1000,
-    verbose: bool = False
+    verbose: bool = False,
+    cache_dir: Optional[str] = None,
 ) -> Tuple[List[int], List[float]]:
     """
     Select neurons using an L1-regularized linear model (LASSO), which produces sparse coefficient vectors.
@@ -32,6 +98,22 @@ def select_neurons_lasso(
     Returns:
         Indices of selected neurons and corresponding coefficients
     """
+    cache_signature = _selection_cache_signature(
+        activations,
+        target,
+        "lasso",
+        {
+            "classification": classification,
+            "alpha": alpha,
+            "max_iter": max_iter,
+            "n_select": n_select,
+        },
+    )
+    cached = _load_selection_cache(cache_dir, cache_signature)
+    if cached is not None:
+        sorted_indices, coefficients = cached
+        return sorted_indices[:n_select], coefficients[:n_select]
+
     # Standardize features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(activations)
@@ -43,7 +125,7 @@ def select_neurons_lasso(
         start_time = time.time()
         if classification:
             model = LogisticRegression(
-                penalty='l1', 
+                l1_ratio=1.0,
                 solver='liblinear',
                 C=1/alpha,
                 max_iter=max_iter
@@ -71,7 +153,7 @@ def select_neurons_lasso(
             
             if classification:
                 model = LogisticRegression(
-                    penalty='l1',
+                    l1_ratio=1.0,
                     solver='liblinear',
                     C=1/alpha,
                     max_iter=max_iter
@@ -102,15 +184,24 @@ def select_neurons_lasso(
             print(f"Warning: Search ended with {n_nonzero} features (target: {n_select})")
     
     # Get top neurons by absolute coefficient value
-    sorted_indices = np.argsort(-np.abs(coef))[:n_select]
-    selected_coefs = coef[sorted_indices]  # Return raw coefficients
-    
-    return sorted_indices.tolist(), selected_coefs.tolist()
+    sorted_indices = np.argsort(-np.abs(coef))
+    sorted_coefficients = coef[sorted_indices]
+    _save_selection_cache(
+        cache_dir,
+        cache_signature,
+        sorted_indices,
+        sorted_coefficients,
+    )
+
+    selected_indices = sorted_indices[:n_select]
+    selected_coefs = sorted_coefficients[:n_select]
+    return selected_indices.tolist(), selected_coefs.tolist()
 
 def select_neurons_correlation(
     activations: np.ndarray,
     target: np.ndarray,
     n_select: int,
+    cache_dir: Optional[str] = None,
     **kwargs
 ) -> Tuple[List[int], List[float]]:
     """
@@ -126,16 +217,36 @@ def select_neurons_correlation(
     Returns:
         Indices of selected neurons and corresponding correlations
     """
+    cache_signature = _selection_cache_signature(
+        activations,
+        target,
+        "correlation",
+        {"n_select": n_select},
+    )
+    cached = _load_selection_cache(cache_dir, cache_signature)
+    if cached is not None:
+        sorted_indices, coefficients = cached
+        return sorted_indices[:n_select], coefficients[:n_select]
+
     correlations = np.array([
         pearsonr(activations[:, i], target)[0]
         for i in range(activations.shape[1])
     ])
     
     # Sort by absolute correlation but return raw correlations
-    sorted_indices = np.argsort(-np.abs(correlations))[:n_select]
-    selected_correlations = correlations[sorted_indices]
-    
-    return sorted_indices.tolist(), selected_correlations.tolist()
+    sorted_indices = np.argsort(-np.abs(correlations))
+    sorted_correlations = correlations[sorted_indices]
+    _save_selection_cache(
+        cache_dir,
+        cache_signature,
+        sorted_indices,
+        sorted_correlations,
+    )
+
+    return (
+        sorted_indices[:n_select].tolist(),
+        sorted_correlations[:n_select].tolist(),
+    )
 
 def select_neurons_separation_score(
     activations: np.ndarray,
@@ -143,6 +254,7 @@ def select_neurons_separation_score(
     n_select: int,
     n_top_activating: int = 100,
     n_zero_activating: Optional[int] = None,
+    cache_dir: Optional[str] = None,
     **kwargs
 ) -> Tuple[List[int], List[float]]:
     """
@@ -158,6 +270,21 @@ def select_neurons_separation_score(
     Returns:
         Indices of selected neurons and corresponding separation scores
     """
+    cache_signature = _selection_cache_signature(
+        activations,
+        target,
+        "separation_score",
+        {
+            "n_select": n_select,
+            "n_top_activating": n_top_activating,
+            "n_zero_activating": n_zero_activating,
+        },
+    )
+    cached = _load_selection_cache(cache_dir, cache_signature)
+    if cached is not None:
+        sorted_indices, coefficients = cached
+        return sorted_indices[:n_select], coefficients[:n_select]
+
     scores = []
     for i in range(activations.shape[1]):
         neuron_acts = activations[:, i]
@@ -187,16 +314,26 @@ def select_neurons_separation_score(
         scores.append(top_mean - zero_mean)
     
     scores = np.array(scores)
-    sorted_indices = np.argsort(-np.abs(scores))[:n_select]
-    selected_scores = scores[sorted_indices]
-    
-    return sorted_indices.tolist(), selected_scores.tolist()
+    sorted_indices = np.argsort(-np.abs(scores))
+    sorted_scores = scores[sorted_indices]
+    _save_selection_cache(
+        cache_dir,
+        cache_signature,
+        sorted_indices,
+        sorted_scores,
+    )
+
+    return (
+        sorted_indices[:n_select].tolist(),
+        sorted_scores[:n_select].tolist(),
+    )
 
 def select_neurons_custom(
     activations: np.ndarray,
     target: np.ndarray,
     n_select: int,
-    metric_fn: Callable[[np.ndarray, np.ndarray], float]
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    cache_dir: Optional[str] = None,
 ) -> Tuple[List[int], List[float]]:
     """
     Select neurons using a custom metric function.
@@ -211,15 +348,36 @@ def select_neurons_custom(
     Returns:
         Indices of selected neurons and corresponding scores
     """
+    metric_name = f"{getattr(metric_fn, '__module__', '')}.{getattr(metric_fn, '__qualname__', repr(metric_fn))}"
+    cache_signature = _selection_cache_signature(
+        activations,
+        target,
+        "custom",
+        {"n_select": n_select, "metric_fn": metric_name},
+    )
+    cached = _load_selection_cache(cache_dir, cache_signature)
+    if cached is not None:
+        sorted_indices, coefficients = cached
+        return sorted_indices[:n_select], coefficients[:n_select]
+
     scores = np.array([
         metric_fn(activations[:, i], target)
         for i in range(activations.shape[1])
     ])
     
-    sorted_indices = np.argsort(scores)[-n_select:]
-    selected_scores = scores[sorted_indices]
-    
-    return sorted_indices.tolist(), selected_scores.tolist()
+    sorted_indices = np.argsort(scores)[::-1]
+    sorted_scores = scores[sorted_indices]
+    _save_selection_cache(
+        cache_dir,
+        cache_signature,
+        sorted_indices,
+        sorted_scores,
+    )
+
+    return (
+        sorted_indices[:n_select].tolist(),
+        sorted_scores[:n_select].tolist(),
+    )
 
 def select_neurons(
     activations: np.ndarray,
@@ -227,6 +385,7 @@ def select_neurons(
     n_select: int,
     method: str = "lasso",
     classification: bool = False,
+    cache_dir: Optional[str] = None,
     **kwargs
 ) -> Tuple[List[int], List[float]]:
     """
@@ -240,6 +399,7 @@ def select_neurons(
         n_select: Number of neurons to select
         method: One of "lasso", "correlation", or "custom"
         classification: Whether this is a classification task
+        cache_dir: Optional directory for caching ranked indices and coefficients/scores
         **kwargs: Additional arguments passed to specific method
     
     Returns:
@@ -255,6 +415,7 @@ def select_neurons(
             target=target,
             n_select=n_select,
             classification=classification,
+            cache_dir=cache_dir,
             **kwargs
         )
     elif method == "correlation":
@@ -262,6 +423,7 @@ def select_neurons(
             activations=activations,
             target=target,
             n_select=n_select,
+            cache_dir=cache_dir,
             **kwargs
         )
     elif method == "separation_score":
@@ -269,6 +431,7 @@ def select_neurons(
             activations=activations,
             target=target,
             n_select=n_select,
+            cache_dir=cache_dir,
             **kwargs
         )
     elif method == "custom":
@@ -278,6 +441,7 @@ def select_neurons(
             activations=activations,
             target=target,
             n_select=n_select,
+            cache_dir=cache_dir,
             **kwargs
         )
     else:
