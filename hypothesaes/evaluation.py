@@ -7,6 +7,8 @@ from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
 from scipy.stats import pearsonr, ttest_ind
 from scipy.optimize import linear_sum_assignment
 import statsmodels.api as sm
+from statsmodels.regression.linear_model import RegressionResultsWrapper
+
 from tqdm.auto import tqdm
 
 from .llm_api import get_completion
@@ -170,7 +172,7 @@ def compute_ols_metrics(
     # Get coefficients and p-values
     coefs_pvals = {
         hyp: (coef, pval) 
-        for hyp, coef, pval in zip(hypotheses, results.params[1:], results.pvalues[1:])
+        for hyp, coef, pval in zip(hypotheses, results.params[1:], results.pvalues[1:], strict=True)
     }
     
     return metrics, coefs_pvals
@@ -196,17 +198,17 @@ def score_hypotheses(
         print_summary=print_summary
     )
 
-    # Compute count of significant hypotheses after Bonferroni correction
-    corrected_p_value_threshold = corrected_pval_threshold / len(hypothesis_annotations)
-    significant_hypotheses = [hyp for hyp, (_, pval) in coefs_pvals.items() if pval < corrected_p_value_threshold]
-    metrics['Significant'] = (len(significant_hypotheses), len(hypothesis_annotations), corrected_p_value_threshold)
-    
     # Create base dataframe
     hypothesis_df = pd.DataFrame({
         'hypothesis': list(coefs_pvals.keys()),
         'regression_coef': [coef for coef, _ in coefs_pvals.values()],
         'regression_pval': [pval for _, pval in coefs_pvals.values()]
     })
+
+    # Compute count of significant hypotheses after Bonferroni correction
+    corrected_p_value_threshold = corrected_pval_threshold / len(hypothesis_annotations)
+    hypothesis_df['significant'] = hypothesis_df['regression_pval'].apply(lambda x: x < corrected_p_value_threshold)
+    metrics['Significant'] = (int(hypothesis_df['significant'].sum()), len(hypothesis_annotations), corrected_p_value_threshold)
     
     # Add feature prevalence
     hypothesis_df['feature_prevalence'] = [
@@ -225,9 +227,19 @@ def score_hypotheses(
     hypothesis_df['separation_pval'] = [
         separation_scores[h][1] for h in hypothesis_df['hypothesis']
     ]
+
+    # Individual AUC for each hypothesis--this was missing before
+    indv_auc_scores = []
+    for h in hypothesis_df['hypothesis']:
+        x = hypothesis_annotations[h]
+        coef, _ = coefs_pvals[h]
+        indv_auc_scores.append(roc_auc_score(y_true, x * coef))
+    hypothesis_df['auc'] = indv_auc_scores
+
     
     # Sort by coefficient magnitude
-    hypothesis_df = hypothesis_df[['hypothesis', 'separation_score', 'separation_pval', 'regression_coef', 'regression_pval', 'feature_prevalence']]
+    hypothesis_df = hypothesis_df[['hypothesis', 'separation_score', 'separation_pval', 'regression_coef', 'regression_pval', 'feature_prevalence', 'significant', 'auc']]
     hypothesis_df = hypothesis_df.sort_values('separation_score', ascending=False)
+    hypothesis_df.index.name = "Index"
     
     return metrics, hypothesis_df
