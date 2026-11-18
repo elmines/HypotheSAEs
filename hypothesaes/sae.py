@@ -767,7 +767,7 @@ def get_sae_checkpoint_name(m_total_neurons, k_active_neurons, prefix_lengths=No
         return f'SAE_matryoshka_M={m_total_neurons}_K={k_active_neurons}_prefixes={prefix_str}.pt'
 
 def load_model(path: str, device: str = "cuda" if torch.cuda.is_available() else "cpu") -> SparseAutoencoder:
-    ckpt = torch.load(path, pickle_module=pickle)
+    ckpt = torch.load(path, pickle_module=pickle, map_location=device)
     model = SparseAutoencoder(**ckpt["config"]).to(device)
     model.load_state_dict(ckpt["state_dict"])
     print(f"Loaded model from {path} onto device {model.device}")
