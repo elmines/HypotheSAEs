@@ -175,7 +175,7 @@ def compute_ols_metrics(
         for hyp, coef, pval in zip(hypotheses, results.params[1:], results.pvalues[1:], strict=True)
     }
     
-    return metrics, coefs_pvals
+    return metrics, coefs_pvals, results
 
 def score_hypotheses(
     hypothesis_annotations: Dict[str, np.ndarray],
@@ -183,7 +183,8 @@ def score_hypotheses(
     classification: bool = False,
     corrected_pval_threshold: float = 0.1,
     print_summary: bool = False,
-) -> Tuple[Dict[str, float], pd.DataFrame]:
+    predictor: Optional[RegressionResultsWrapper] = None
+) -> Tuple[Dict[str, float], pd.DataFrame, RegressionResultsWrapper]:
     """
     Evaluate hypotheses on real dataset.
     
@@ -191,12 +192,14 @@ def score_hypotheses(
         Tuple of (metrics dict, hypothesis details DataFrame)
     """
     # Get OLS metrics
-    metrics, coefs_pvals = compute_ols_metrics(
+    metrics, coefs_pvals, new_predictor = compute_ols_metrics(
         hypothesis_annotations=hypothesis_annotations,
         y_true=y_true,
         classification=classification,
         print_summary=print_summary
     )
+    if predictor is None:
+        predictor = new_predictor
 
     # Create base dataframe
     hypothesis_df = pd.DataFrame({
@@ -242,4 +245,4 @@ def score_hypotheses(
     hypothesis_df = hypothesis_df.sort_values('separation_score', ascending=False)
     hypothesis_df.index.name = "Index"
     
-    return metrics, hypothesis_df
+    return metrics, hypothesis_df, predictor
