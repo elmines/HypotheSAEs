@@ -104,41 +104,45 @@ def compute_hypothesis_separation_scores(
     Returns dict mapping hypothesis to (effect_size, p_value).
     """
     results = {}
+    bad_value = (0.0, 1.0) # 0 effect size, p=1
     for hypothesis, annotations in hypothesis_annotations.items():
-        if -1 in annotations:
-            # For pairwise data we want to compute E[Y | A == 1] + E[1-Y | A == -1]
-            pos_mean = 0.5*(np.mean(y_true[annotations == 1]) + np.mean(1 - y_true[annotations == -1]))
-        else:
-            pos_mean = np.mean(y_true[annotations == 1])
+        pos_mask = annotations == 1
+        neg_mask = annotations == -1
+        zero_mask = annotations == 0
 
-        neg_mean = np.mean(y_true[annotations == 0])
+        if np.any(pos_mask) and np.any(neg_mask):
+            # For pairwise data we want to compute E[Y | A == 1] + E[1-Y | A == -1]
+            pos_mean = 0.5*(np.mean(y_true[pos_mask]) + np.mean(1 - y_true[neg_mask]))
+        elif np.any(pos_mask):
+            pos_mean = np.mean(y_true[pos_mask])
+        elif np.any(neg_mask):
+            pos_mean = np.mean(y_true[neg_mask])
+        else:
+            print(f"No nonzero samples for \"{hypothesis}\". Setting p=1")
+            results[hypothesis] = bad_value
+            continue
+
+        if not np.any(zero_mask):
+            print(f"No zero samples for \"{hypothesis}\". Setting p=1")
+            results[hypothesis] = bad_value
+            continue
+
+        neg_mean = np.mean(y_true[zero_mask])
         effect_size = pos_mean - neg_mean
         
         # T-test between groups
-        pos_vals = np.concatenate([y_true[annotations == 1], -1*y_true[annotations == -1]])
-        neg_vals = y_true[annotations == 0]
+        pos_vals = np.concatenate([y_true[pos_mask], -1*y_true[neg_mask]])
+        neg_vals = y_true[zero_mask]
         _, p_value = ttest_ind(pos_vals, neg_vals)
         
         results[hypothesis] = (effect_size, p_value)
     
     return results
 
-def compute_ols_metrics(
-    hypothesis_annotations: Dict[str, np.ndarray],
-    y_true: np.ndarray,
-    classification: bool = False,
-    print_summary: bool = False
-) -> Tuple[Dict[str, float], Dict[str, Tuple[float, float]]]:
-    """
-    Compute OLS/Logistic regression metrics for hypotheses.
-    
-    Returns:
-        Tuple of (metrics dict, coefficient/p-value dict)
-    """
-    hypotheses = list(hypothesis_annotations.keys())
-    X = np.array([hypothesis_annotations[h] for h in hypotheses]).T
-    X = sm.add_constant(X)
-    
+def fit_sm(X: np.ndarray,
+        y_true: np.ndarray,
+        classification=True,
+        print_summary=False) -> RegressionResultsWrapper:
     if classification:
         model = sm.Logit(y_true, X)
     else:
@@ -153,6 +157,30 @@ def compute_ols_metrics(
     
     if print_summary:
         print(results.summary())
+    return results
+
+def compute_ols_metrics(
+    hypothesis_annotations: Dict[str, np.ndarray],
+    y_true: np.ndarray,
+    classification: bool = False,
+    print_summary: bool = False,
+    results: Optional[RegressionResultsWrapper] = None,
+) -> Tuple[Dict[str, float], Dict[str, Tuple[float, float]]]:
+    """
+    Compute OLS/Logistic regression metrics for hypotheses.
+    
+    Returns:
+        Tuple of (metrics dict, coefficient/p-value dict)
+    """
+    hypotheses = list(hypothesis_annotations.keys())
+    X = np.array([hypothesis_annotations[h] for h in hypotheses]).T
+    X = sm.add_constant(X)
+    
+    if results is None:
+        results = fit_sm(X,
+                        y_true,
+                        classification=classification,
+                        print_summary=print_summary)
     
     # Get metrics
     metrics = {}
@@ -196,7 +224,8 @@ def score_hypotheses(
         hypothesis_annotations=hypothesis_annotations,
         y_true=y_true,
         classification=classification,
-        print_summary=print_summary
+        print_summary=print_summary,
+        results=predictor
     )
     if predictor is None:
         predictor = new_predictor
