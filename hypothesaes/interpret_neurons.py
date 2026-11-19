@@ -96,7 +96,7 @@ def _sample_percentile(vals: np.ndarray,
     n = min(n, len(indices))
     return rng.choice(indices, size=n, replace=False)
 
-def _sample_zero(vals: np.ndaray, rng: np.random.Generator, n: int):
+def _sample_zero(vals: np.ndarray, rng: np.random.Generator, n: int):
     indices = np.where(vals == 0)[0]
     if len(indices) <= n:
         return indices
