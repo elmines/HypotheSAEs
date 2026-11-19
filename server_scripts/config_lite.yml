@@ -2,7 +2,7 @@ model_list:
   - model_name: openai/gpt-oss-20b
     litellm_params:
       model: openai/openai/gpt-oss-20b
-      api_base: http://0.0.0.0:8001/v1
+      api_base: http://0.0.0.0:8012/v1
       api_key: local-no-auth
     model_info:
       supports_reasoning: True
@@ -10,13 +10,8 @@ model_list:
   - model_name: openai/gpt-oss-120b
     litellm_params:
       model: openai/openai/gpt-oss-120b
-      api_base: http://0.0.0.0:8002/v1
+      api_base: http://0.0.0.0:8011/v1
       api_key: local-no-auth
     model_info:
       supports_reasoning: True
 
-  # - model_name: nomic-ai/modernbert-embed-base
-  #   litellm_params:
-  #     model: openai/nomic-ai/modernbert-embed-base
-  #     api_base: http://0.0.0.0:8002/v1
-  #     api_key: local-no-auth
