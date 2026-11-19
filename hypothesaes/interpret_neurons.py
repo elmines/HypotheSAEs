@@ -63,6 +63,45 @@ def sample_top_zero(
         "negative_activations": neuron_acts[random_indices].tolist()
     }
 
+
+def ternary_sample_percentile_bins(
+    texts: List[str],
+    activations: np.ndarray,
+    neuron_idx: int,
+    n_examples: int,
+    max_words_per_example: Optional[int] = None,
+    high_percentile: Tuple[float, float] = (90, 100),
+    low_percentile: Optional[Tuple[float, float]] = None,
+    random_seed: Optional[int] = None
+) -> Dict[str, List[str]]:
+    """Sample examples from high activation percentile bins and either low percentile or zero activations."""
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    n_per_class = n_examples // 3
+
+    neuron_acts = activations[:, neuron_idx]
+    pos_mask = neuron_acts > 0
+    zero_mask = neuron_acts == 0
+    neg_mask = neuron_acts < 0
+
+def _sample_percentile(vals: np.ndarray,
+                       lower_bound: int,
+                       upper_bound: int,
+                       rng: np.random.Generator,
+                       n: int):
+    abs_vals = np.abs(vals)
+    mask = (abs_vals >= np.percentile(abs_vals, lower_bound)) & \
+               (abs_vals <= np.percentile(abs_vals, upper_bound))
+    indices = np.where(mask)[0]
+    n = min(n, len(indices))
+    return rng.choice(indices, size=n, replace=False)
+
+def _sample_zero(vals: np.ndaray, rng: np.random.Generator, n: int):
+    indices = np.where(vals == 0)[0]
+    if len(indices) <= n:
+        return indices
+    return rng.choice(indices, size=n, replace=False)
+
 def sample_percentile_bins(
     texts: List[str],
     activations: np.ndarray,
@@ -80,31 +119,18 @@ def sample_percentile_bins(
     neuron_acts = activations[:, neuron_idx]
     n_per_class = n_examples // 2
     
-    pos_mask = neuron_acts > 0
-    pos_vals = neuron_acts[pos_mask]
-    pos_indices = np.where(pos_mask)[0]
+    pos_vals = neuron_acts[neuron_acts > 0]
     
-    high_mask = (pos_vals >= np.percentile(pos_vals, high_percentile[0])) & \
-               (pos_vals <= np.percentile(pos_vals, high_percentile[1]))
-    high_indices = pos_indices[high_mask]
-    if len(high_indices) >= n_per_class:
-        high_sample_indices = np.random.choice(high_indices, size=n_per_class, replace=False)
-    else:
-        print(f"[WARNING] There are less than {n_per_class} examples in bin {high_percentile} for neuron {neuron_idx}; using {len(high_indices)} instead")
-        high_sample_indices = high_indices
+    high_sample_indices = _sample_percentile(pos_vals, *high_percentile, np.random, n_per_class)
+    if len(high_sample_indices) < n_per_class:
+        print(f"[WARNING] There are less than {n_per_class} examples in bin {high_percentile} for neuron {neuron_idx}; using {len(high_sample_indices)} instead")
     
     if low_percentile is not None:
-        low_mask = (pos_vals >= np.percentile(pos_vals, low_percentile[0])) & \
-                  (pos_vals <= np.percentile(pos_vals, low_percentile[1]))
-        low_indices = pos_indices[low_mask]
+        low_sample_indices = _sample_percentile(pos_vals, *low_percentile, np.random, n_per_class)
     else: # Use examples with zero activation as the negative examples
-        low_indices = np.where(neuron_acts == 0)[0]
-
-    if len(low_indices) >= n_per_class:
-        low_sample_indices = np.random.choice(low_indices, size=n_per_class, replace=False)
-    else:
-        print(f"[WARNING] There are less than {n_per_class} examples in bin {low_percentile} for neuron {neuron_idx}; using {len(low_indices)} instead")
-        low_sample_indices = low_indices
+        low_sample_indices = _sample_zero(neuron_acts, np.random, n_per_class)
+    if len(low_sample_indices) < n_per_class:
+        print(f"[WARNING] There are less than {n_per_class} examples in bin {low_percentile} for neuron {neuron_idx}; using {len(low_sample_indices)} instead")
     
     pos_texts = [texts[i] for i in high_sample_indices]
     neg_texts = [texts[i] for i in low_sample_indices]
