@@ -8,6 +8,7 @@ import os
 import json
 import hashlib
 from dataclasses import dataclass, field
+from functools import partial
 
 from .llm_api import get_completion, normalize_llm_kwargs
 from .utils import load_prompt, truncate_text
@@ -70,8 +71,8 @@ def ternary_sample_percentile_bins(
     neuron_idx: int,
     n_examples: int,
     max_words_per_example: Optional[int] = None,
-    high_percentile: Tuple[float, float] = (90, 100),
-    low_percentile: Optional[Tuple[float, float]] = None,
+    high_abs_percentile: Tuple[float, float] = (90, 100),
+    low_abs_percentile: Optional[Tuple[float, float]] = None,
     random_seed: Optional[int] = None
 ) -> Dict[str, List[str]]:
     """Sample examples from high activation percentile bins and either low percentile or zero activations."""
@@ -80,15 +81,57 @@ def ternary_sample_percentile_bins(
     n_per_class = n_examples // 3
 
     neuron_acts = activations[:, neuron_idx]
+
     pos_mask = neuron_acts > 0
-    zero_mask = neuron_acts == 0
+    pos_indices = np.where(pos_mask)[0]
+    high_pos_indices = _sample_percentile(neuron_acts[pos_indices], *high_abs_percentile, np.random, n_per_class)
+    high_pos_sample_indices = pos_indices[high_pos_indices]
+    if len(high_pos_sample_indices) < n_per_class:
+        print(f"[WARNING] < {n_per_class} positive samples in bin {high_abs_percentile} for neuron {neuron_idx}; using {len(high_pos_sample_indices)} instead")
+
     neg_mask = neuron_acts < 0
+    neg_indices = np.where(neg_mask)[0]
+    high_neg_indices = _sample_percentile(np.abs(neuron_acts[neg_indices]), *high_abs_percentile, np.random, n_per_class)
+    high_neg_sample_indices = neg_indices[high_neg_indices]
+    if len(high_neg_sample_indices) < n_per_class:
+        print(f"[WARNING] < {n_per_class} negative samples in bin {high_abs_percentile} for neuron {neuron_idx}; using {len(high_neg_sample_indices)} instead")
+
+    if low_abs_percentile is not None:
+        nonzero_mask = pos_mask | neg_mask
+        nonzero_indices = np.where(nonzero_mask)
+        low_indices = _sample_percentile(np.abs(neuron_acts[nonzero_indices]), *low_abs_percentile, np.random, n_per_class)
+        low_sample_indices = nonzero_indices[low_indices]
+    else:
+        low_sample_indices = _sample_zero(neuron_acts, np.random, n_per_class)
+    if len(low_sample_indices) < n_per_class:
+        print(f"[WARNING] < {n_per_class} neutral samples for neuron {neuron_idx}; using {len(low_sample_indices)} instead")
+
+    def indices_to_texts(indices):
+        nonlocal texts
+        indexed_texts = map(texts.__getitem__, indices)
+        if max_words_per_example:
+            indexed_texts = map(partial(truncate_text, max_words=max_words_per_example), indexed_texts)
+        return list(indexed_texts)
+    def indices_to_acts(indices):
+        return neuron_acts[indices].tolist()
+    
+    rval = {
+        "positive_texts": indices_to_texts(high_pos_sample_indices),
+        "negative_texts": indices_to_texts(high_neg_sample_indices),
+        "neutral_texts" : indices_to_texts(low_sample_indices),
+        "positive_activations": indices_to_acts(high_pos_sample_indices),
+        "negative_activations": indices_to_acts(high_neg_sample_indices),
+        "neutral_activations" : indices_to_acts(low_sample_indices)
+    }
+    return rval
 
 def _sample_percentile(vals: np.ndarray,
                        lower_bound: int,
                        upper_bound: int,
                        rng: np.random.Generator,
                        n: int):
+    if len(vals) == 0:
+        return np.array([], dtype=np.uint8)
     abs_vals = np.abs(vals)
     mask = (abs_vals >= np.percentile(abs_vals, lower_bound)) & \
                (abs_vals <= np.percentile(abs_vals, upper_bound))

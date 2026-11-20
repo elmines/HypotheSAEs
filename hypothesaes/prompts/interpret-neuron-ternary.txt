@@ -21,8 +21,9 @@ NEUTRAL SAMPLES:
 
 Rules about the feature you identify:
 - The feature should be objective, focusing on concrete attributes rather than abstract concepts.
-- The feature should be present in the positive samples and absent in the negative samples. Do not output a generic feature which also appears in negative samples.
-- The feature should be as specific as possible, while still applying to all of the positive samples. For example, if all of the positive samples mention Golden or Labrador retrievers, then the feature should be "mentions retriever dogs", not "mentions dogs" or "mentions Golden retrievers".
+- The feature should be present in the positive samples and be present in the negative samples with an opposing polarity.
+- The feature should be absent in the neutral samples. Do not output a generic feature which also appears in positive or negative samples.
+- The feature should be as specific as possible, while still applying to all of the positive and negative samples. For example, if all of the positive samples express support for Democrats while the negative samples express support for Republicans, the feature should be "Mentions Democrats (pos.) or mentions Republicans (neg.)" as opposed to "Mentions progressives (pos.) or mentions conservatives (neg.)"
 
 Do not output anything besides the feature. Your response should be formatted exactly as shown in the examples above.
 Please suggest exactly one feature, starting with "-" and surrounded by quotes "". Your response is:
