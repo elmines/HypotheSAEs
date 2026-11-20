@@ -584,6 +584,7 @@ class SparseAutoencoder(nn.Module):
             "k_active_neurons": self.k_active_neurons,
             "aux_k": self.aux_k,
             "multi_k": self.multi_k,
+            "use_abs_topk": self.use_abs_topk,
             "dead_neuron_threshold_steps": self.dead_neuron_threshold_steps,
             "prefix_lengths": self.prefix_lengths,
             "use_batch_topk": self.use_batch_topk,
