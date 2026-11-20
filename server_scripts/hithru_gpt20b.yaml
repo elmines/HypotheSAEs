@@ -2,6 +2,6 @@ model: openai/gpt-oss-20b
 host: 0.0.0.0
 port: 8010
 max_model_len: 16384
-max_num_seqs: 16
-max_num_batched_tokens: 8192
+max_num_seqs: 256
+max_num_batched_tokens: 131072
 gpu_memory_utilization: 0.75
