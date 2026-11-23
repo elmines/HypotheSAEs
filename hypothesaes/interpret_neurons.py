@@ -8,11 +8,14 @@ import os
 import json
 import hashlib
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, reduce
+import operator
 
 from .llm_api import get_completion, normalize_llm_kwargs
 from .utils import load_prompt, truncate_text
-from .annotate import annotate, CACHE_DIR
+from .annotate import annotate, CACHE_DIR, parse_ternary_completion
+
+from sklearn.metrics import precision_recall_fscore_support
 
 DEFAULT_TASK_SPECIFIC_INSTRUCTIONS = """An example feature could be:
 - "uses multiple adjectives to describe colors"
@@ -65,6 +68,67 @@ def sample_top_zero(
     }
 
 
+
+def ternary_sample_topn(
+        texts: List[str],
+        activations: np.ndarray,
+        neuron_idx: int,
+        n_examples: int,
+        max_words_per_example: Optional[int] = None,
+        random_seed: Optional[int] = None
+):
+    """
+    It disregards percentiles because once you have 3 bins, it can be harder to find sufficient examples.
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    n_per_class = n_examples // 3
+    neuron_acts = activations[:, neuron_idx]
+
+    def _sample_topn(vals: np.ndarray, n: int):
+        if len(vals) == 0:
+            return np.empty([], dtype=np.uint8)
+        sorted_indices = np.argsort(vals)[::-1]
+        return sorted_indices[:n]
+
+    pos_mask = neuron_acts > 0
+    pos_indices = np.where(pos_mask)[0]
+    top_pos_indices = _sample_topn(neuron_acts[pos_indices], n_per_class)
+    sample_pos_indices = pos_indices[top_pos_indices]
+    if (n_pos := len(sample_pos_indices)) < n_per_class:
+        print(f"[WARNING] Only {n_pos} < {n_per_class} positive examples available for {neuron_idx}")
+
+    neg_mask = neuron_acts < 0
+    neg_indices = np.where(neg_mask)[0]
+    top_neg_indices = _sample_topn(np.abs(neuron_acts[neg_indices]), n_per_class)
+    sample_neg_indices = neg_indices[top_neg_indices]
+    if (n_neg := len(sample_neg_indices)) < n_per_class:
+        print(f"[WARNING] Only {n_neg} < {n_per_class} negative examples available for {neuron_idx}")
+
+    sample_zero_indices = _sample_zero(neuron_acts, np.random, n_per_class)
+    if (n_neg := len(sample_neg_indices)) < n_per_class:
+        print(f"[WARNING] Only {n_neg} < {n_per_class} neutral examples available for {neuron_idx}")
+
+    local_i2t = partial(_indices_to_texts, texts=texts, max_words_per_example=max_words_per_example)
+    def indices_to_acts(indices):
+        return neuron_acts[indices].tolist()
+    rval = {
+        "positive_texts": local_i2t(sample_pos_indices),
+        "negative_texts": local_i2t(sample_neg_indices),
+        "neutral_texts": local_i2t(sample_zero_indices),
+        "positive_activations": indices_to_acts(sample_pos_indices),
+        "negative_activations": indices_to_acts(sample_neg_indices),
+        "neutral_activations": indices_to_acts(sample_zero_indices),
+
+    }
+    return rval
+
+def _indices_to_texts(indices: np.ndarray, texts: List[str], max_words_per_example: Optional[int]=None):
+    indexed_texts = map(texts.__getitem__, indices)
+    if max_words_per_example:
+        indexed_texts = map(partial(truncate_text, max_words=max_words_per_example), indexed_texts)
+    return list(indexed_texts)
+
 def ternary_sample_percentile_bins(
     texts: List[str],
     activations: np.ndarray,
@@ -75,7 +139,7 @@ def ternary_sample_percentile_bins(
     low_abs_percentile: Optional[Tuple[float, float]] = None,
     random_seed: Optional[int] = None
 ) -> Dict[str, List[str]]:
-    """Sample examples from high activation percentile bins and either low percentile or zero activations."""
+    """Sample examples from highly positive activation percentile bins, highly negative activation percentile bins, and zero activation bins."""
     if random_seed is not None:
         np.random.seed(random_seed)
     n_per_class = n_examples // 3
@@ -106,19 +170,15 @@ def ternary_sample_percentile_bins(
     if len(low_sample_indices) < n_per_class:
         print(f"[WARNING] < {n_per_class} neutral samples for neuron {neuron_idx}; using {len(low_sample_indices)} instead")
 
-    def indices_to_texts(indices):
-        nonlocal texts
-        indexed_texts = map(texts.__getitem__, indices)
-        if max_words_per_example:
-            indexed_texts = map(partial(truncate_text, max_words=max_words_per_example), indexed_texts)
-        return list(indexed_texts)
     def indices_to_acts(indices):
         return neuron_acts[indices].tolist()
+
+    local_i2t = partial(_indices_to_texts, texts=texts, max_words_per_example=max_words_per_example)
     
     rval = {
-        "positive_texts": indices_to_texts(high_pos_sample_indices),
-        "negative_texts": indices_to_texts(high_neg_sample_indices),
-        "neutral_texts" : indices_to_texts(low_sample_indices),
+        "positive_texts": local_i2t(high_pos_sample_indices),
+        "negative_texts": local_i2t(high_neg_sample_indices),
+        "neutral_texts" : local_i2t(low_sample_indices),
         "positive_activations": indices_to_acts(high_pos_sample_indices),
         "negative_activations": indices_to_acts(high_neg_sample_indices),
         "neutral_activations" : indices_to_acts(low_sample_indices)
@@ -254,6 +314,8 @@ class ScoringConfig:
     max_words_per_example: Optional[int] = 256 # Maximum number of words per text example, truncated if necessary
     sampling_function: Callable = sample_top_zero # Function to sample examples for scoring
     sampling_kwargs: Dict[str, Any] = field(default_factory=dict) # Extra keyword arguments for the sampling function
+
+pass
 
 class NeuronInterpreter:
     def __init__(
@@ -635,6 +697,100 @@ class NeuronInterpreter:
                 all_metrics[neuron_idx][interp] = self._compute_metrics(
                     annotations=np.array(annot),
                     labels=neuron_scoring_info['binarized_activations'],
+                    activations=neuron_scoring_info['activations']
+                )
+
+        return all_metrics
+
+    def ternary_score_interpretations(
+        self,
+        texts: List[str],
+        activations: np.ndarray,
+        interpretations: Dict[int, List[str]],
+        config: Optional[ScoringConfig] = None,
+        show_progress: bool = True,
+        **annotation_kwargs
+    ) -> Dict[int, Dict[str, Dict[str, float]]]:
+        """Score all interpretations for all neurons."""
+        config = config or ScoringConfig()
+        annotation_kwargs.setdefault("annotate_prompt_name", "annotate-ternary")
+        annotation_kwargs.setdefault("parse_fn", parse_ternary_completion)
+
+
+        tasks = []
+        scoring_info = {}
+
+        for neuron_idx, neuron_interps in interpretations.items():
+            formatted_examples = config.sampling_function(
+                texts=texts,
+                activations=activations,
+                neuron_idx=neuron_idx,
+                n_examples=config.n_examples,
+                max_words_per_example=config.max_words_per_example,
+                random_seed=neuron_idx,  # Deterministic seed based on neuron_idx
+                **config.sampling_kwargs
+            )
+            
+            eval_texts = reduce(operator.add, map(formatted_examples.__getitem__, ['positive_texts', 'negative_texts', 'neutral_texts']), [])
+            neuron_acts = reduce(operator.add, map(formatted_examples.__getitem__,['positive_activations', 'negative_activations', 'neutral_activations']), [])
+
+            scoring_info[neuron_idx] = {
+                'texts': eval_texts,
+                'activations': neuron_acts,
+                'ternarized_activations': np.concatenate([
+                     np.ones(len(formatted_examples["positive_texts"])),
+                    -np.ones(len(formatted_examples["negative_texts"])),
+                     np.zeros(len(formatted_examples["neutral_texts"]))
+                ])
+            }
+
+            for interp in neuron_interps:
+                if interp is None:
+                    continue
+                for text in eval_texts:
+                    tasks.append((text, interp))
+
+        # Annotate all tasks
+        cache_path = None if self.cache_name is None else os.path.join(CACHE_DIR, f"{self.cache_name}_interp-scoring.json")
+        progress_desc = f"Scoring neuron interpretation fidelity ({len(interpretations)} neurons; {len(next(iter(interpretations.values())))} candidate interps per neuron; {config.n_examples} examples to score each interp)"
+        annotations = annotate(
+            tasks=tasks,
+            cache_path=cache_path,
+            n_workers=self.n_workers_annotation,
+            show_progress=show_progress,
+            model=self.annotator_model,
+            progress_desc=progress_desc,
+            **annotation_kwargs
+        )
+
+        def _compute_ternary_metrics(
+            annotations: np.ndarray,
+            labels: np.ndarray,
+            activations: np.ndarray
+        ) -> Dict[str, float]:
+            prec, rec, f1, _ = precision_recall_fscore_support(y_true=labels, y_pred=annotations, average='macro')
+            correlation = np.corrcoef(activations, annotations)[0,1] if len(np.unique(annotations)) > 1 else 0.0
+            return {
+                "recall": rec,
+                "precision": prec,
+                "f1": f1,
+                "correlation": correlation
+            }
+
+        # Compute metrics for all interpretations
+        all_metrics = {}
+        for neuron_idx, neuron_interps in interpretations.items():
+            all_metrics[neuron_idx] = {}
+            neuron_scoring_info = scoring_info[neuron_idx]
+
+            for interp in neuron_interps:
+                if interp is None:
+                    all_metrics[neuron_idx][interp] = {"recall": 0.0, "precision": 0.0, "f1": 0.0, "correlation": 0.0}
+                    continue
+                annot = [annotations[interp][text] for text in neuron_scoring_info['texts']]
+                all_metrics[neuron_idx][interp] = _compute_ternary_metrics(
+                    annotations=np.array(annot),
+                    labels=neuron_scoring_info['ternarized_activations'],
                     activations=neuron_scoring_info['activations']
                 )
 

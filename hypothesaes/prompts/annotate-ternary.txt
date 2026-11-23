@@ -1,0 +1,5 @@
+Check whether the TEXT satisfies the positive version of a PROPERTY, the negative version of the PROPERTY, or neither. Response "positive" for positive satisfaction, "negative" for negative satisfaction, and "neither" if it satisifies neither. When uncertain, output "neither". Do not include any other text in your response.
+
+PROPERTY: "{hypothesis}"
+TEXT: "{text}"
+Output ("positive" or "negative" or "neither"):

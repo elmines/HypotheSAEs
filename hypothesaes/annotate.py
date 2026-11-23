@@ -52,10 +52,20 @@ def _store_annotation(
     if cache is not None:
         cache[generate_cache_key(concept, text)] = annotation
 
-def parse_completion(completion: str) -> int:
-    """Parse a completion into an annotation."""
+def _strip_reasoning(completion: str) -> str:
     if '</think>' in completion:
         completion = completion.split('</think>')[1].strip()
+    return completion
+
+def parse_ternary_completion(completion: str) -> Optional[int]:
+    completion = _strip_reasoning(completion).lower()
+    return 1 if completion.startswith("positive") \
+        else -1 if completion.startswith("negative") \
+        else 0
+
+def parse_completion(completion: str) -> Optional[int]:
+    """Parse a completion into an annotation."""
+    completion = _strip_reasoning(completion)
     return 1 if completion.startswith("yes") else 0 if completion.startswith("no") else None
 
 def parse_completion_json(completion: str) -> Optional[int]:
