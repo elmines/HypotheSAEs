@@ -106,8 +106,8 @@ def compute_hypothesis_separation_scores(
     results = {}
     bad_value = (0.0, 1.0) # 0 effect size, p=1
     for hypothesis, annotations in hypothesis_annotations.items():
-        pos_mask = annotations == 1
-        neg_mask = annotations == -1
+        pos_mask = annotations > 0
+        neg_mask = annotations < 0
         zero_mask = annotations == 0
 
         if np.any(pos_mask) and np.any(neg_mask):
